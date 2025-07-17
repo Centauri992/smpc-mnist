@@ -11,23 +11,25 @@ from torchvision import datasets, transforms
 secint = None
 
 def load_custom_W_b(export_dir, layer_idx):
-    W = np.load(os.path.join(export_dir, f'layer{layer_idx}_weight.npy'))   # (out, in)
+    W = np.load(os.path.join(export_dir, f'layer{layer_idx}_weight.npy'))
     b = np.load(os.path.join(export_dir, f'layer{layer_idx}_bias.npy'))
-    W = W.astype(np.int64).T     # <-- add .T for correct (in, out) order
+    W = W.astype(np.int64).T
     b = b.astype(np.int64)
     return secint.array(W), secint.array(b)
 
 def load_pytorch_mnist(batch_size=1, offset=0):
-    # Always load test set (10,000 images)
-    transform = transforms.Compose([transforms.ToTensor()])
+    transform = transforms.Compose([
+        transforms.ToTensor(),
+        transforms.Lambda(lambda x: x * 2 - 1)
+    ])
     mnist = datasets.MNIST(root="./data", train=False, download=True, transform=transform)
     images = []
     labels = []
     for idx in range(offset, offset+batch_size):
         img, label = mnist[idx]
-        images.append(img.numpy().reshape(-1) * 255)  # uint8-like, shape (784,)
+        images.append(img.numpy().reshape(-1))
         labels.append(label)
-    arr = np.stack(images).astype(np.uint8)
+    arr = np.stack(images)
     return arr, labels
 
 # --- Protocols (unchanged, from np_bnnmnist.py) ---
@@ -138,7 +140,6 @@ async def main():
     offset = args.offset
     export_dir = args.export_dir
 
-    # Protocol selection as in np_bnnmnist.py
     if args.no_legendre:
         secint = mpc.SecInt(14)
         bsgn = lambda L: (L >= 0)*2 - 1
@@ -155,27 +156,20 @@ async def main():
 
     await mpc.start()
 
-    # --- LOAD DATA
+    # --- LOAD DATA ---
     images, labels = load_pytorch_mnist(batch_size, offset)
-    print(f'Labels: {labels}')
-    if batch_size == 1:
-        x = np.array(images[0]).reshape(28, 28)
-        print(np.array2string(np.vectorize(lambda a: int(bool((a/255))))(x), separator=''))
 
-    # --- Secret-share image
+    # --- Secret-share image ---
     L = secint.array(images.astype(np.int64))
-
     total_start = time.time()
-    n_errors = 0
-    predictions = []
-
-    # --- LAYER 1
+    
+    # --- LAYER 1 ---
     W, b = load_custom_W_b(export_dir, 0)
     L = L @ W + b
     L = (L >= 0)*2 - 1
     await mpc.barrier('after-layer-1')
 
-    # --- LAYER 2
+    # --- LAYER 2 ---
     t2_start = time.time()
     W, b = load_custom_W_b(export_dir, 1)
     L = L @ W + b
@@ -188,7 +182,7 @@ async def main():
     await mpc.barrier('after-layer-2')
     t2_end = time.time()
 
-    # --- LAYER 3
+    # --- LAYER 3 ---
     t3_start = time.time()
     W, b = load_custom_W_b(export_dir, 2)
     L = L @ W + b
@@ -201,21 +195,18 @@ async def main():
     await mpc.barrier('after-layer-3')
     t3_end = time.time()
 
-    # --- LAYER 4
+    # --- LAYER 4 ---
     W, b = load_custom_W_b(export_dir, 3)
     L = L @ W + b
 
-    # --- OUTPUT
+    # --- OUTPUT ---
     out_start = time.time()
+    n_errors = 0
     for i in range(batch_size):
         logits = await mpc.output(L[i])
         pred = int(np.argmax(logits))
-        predictions.append(pred)
-        error = '******* ERROR *******' if pred != labels[i] else ''
-        if batch_size <= 20:  # Print details only for small batch sizes
-            print(f'Image #{offset+i} with label {labels[i]}: {pred} predicted. {error}')
-            print(logits)
-        if pred != labels[i]:
+        true_label = labels[i]
+        if pred != true_label:
             n_errors += 1
     out_end = time.time()
 
